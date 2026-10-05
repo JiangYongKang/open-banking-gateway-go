@@ -10,6 +10,7 @@ import (
 	"github.com/highcumontoa/open-banking-gateway-go/internal/gateway"
 	"github.com/highcumontoa/open-banking-gateway-go/internal/idempotency"
 	"github.com/highcumontoa/open-banking-gateway-go/internal/ledger"
+	"github.com/highcumontoa/open-banking-gateway-go/internal/quota"
 	"github.com/highcumontoa/open-banking-gateway-go/internal/ratelimit"
 )
 
@@ -24,11 +25,25 @@ func main() {
 		ID: "c-expired", TenantID: "tenant-a", ClientID: "client-1",
 		Scopes: []string{"payment:write"}, ExpiresAt: now.Add(-time.Minute),
 	}))
+	// 带周期额度的同意：每周最多 2 笔（笔数上限）。
+	must(store.Create(consent.Consent{
+		ID: "c-quota", TenantID: "tenant-a", ClientID: "client-1",
+		Scopes: []string{"payment:write"}, ExpiresAt: now.Add(time.Hour),
+		Quota: quota.Policy{Period: quota.PeriodWeekly, MaxCount: 2},
+	}))
+
+	// 仅金额上限的同意：每周累计不超过 1500 CNY，不限笔数。
+	must(store.Create(consent.Consent{
+		ID: "c-quota-amt", TenantID: "tenant-a", ClientID: "client-1",
+		Scopes: []string{"payment:write"}, ExpiresAt: now.Add(time.Hour),
+		Quota: quota.Policy{Period: quota.PeriodWeekly, MaxAmount: 1500, Currency: "CNY"},
+	}))
 
 	gw := gateway.New(
 		consent.NewAuthorizer(store, time.Now),
 		idempotency.NewMemoryStore(),
-		ratelimit.NewLimiter(ratelimit.Limit{Requests: 3, Window: time.Minute}, time.Now),
+		ratelimit.NewLimiter(ratelimit.Limit{Requests: 5, Window: time.Minute}, time.Now),
+		quota.NewManager(time.Now),
 		ledger.NewMock(),
 		time.Now,
 	)
@@ -70,8 +85,40 @@ func main() {
 	scope.IdempotencyKey = "k-5"
 	run("scope insufficient", scope)
 
-	for i := 0; i < 3; i++ {
+	// 同意级周期额度：独立 client 维度，先于限流演示，避免被限流桶干扰。
+	// 笔数上限：每周 2 笔。
+	q1 := base
+	q1.ClientID = "client-q"
+	q1.ConsentID = "c-quota"
+	q1.Amount = 1000
+	q1.IdempotencyKey = "k-q-1"
+	run("quota write #1", q1)
+	q2 := q1
+	q2.IdempotencyKey = "k-q-2"
+	run("quota write #2", q2)
+	q3 := q1
+	q3.IdempotencyKey = "k-q-3"
+	run("quota write #3 (exhaust)", q3)
+	qretry := q1
+	qretry.IdempotencyKey = "k-q-1"
+	run("quota idempotent replay", qretry)
+
+	// 金额预算：每周累计不超过 1500 CNY；1000 放行，再发 600 被额度挡下。
+	a1 := base
+	a1.ClientID = "client-q2"
+	a1.ConsentID = "c-quota-amt"
+	a1.Amount = 1000
+	a1.IdempotencyKey = "k-a-1"
+	run("amount quota write #1", a1)
+	a2 := a1
+	a2.Amount = 600
+	a2.IdempotencyKey = "k-a-2"
+	run("amount quota write #2 (over)", a2)
+
+	// 限流用独立 client 维度演示：窗口内前 5 笔放行，第 6 笔被限流。
+	for i := 0; i < 6; i++ {
 		r := base
+		r.ClientID = "client-rl"
 		r.IdempotencyKey = fmt.Sprintf("k-rl-%d", i)
 		run(fmt.Sprintf("rate limit #%d", i+1), r)
 	}

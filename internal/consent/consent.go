@@ -6,6 +6,8 @@ import (
 	"fmt"
 	"sync"
 	"time"
+
+	"github.com/highcumontoa/open-banking-gateway-go/internal/quota"
 )
 
 // Status 表示同意的生命周期状态。
@@ -25,6 +27,8 @@ type Consent struct {
 	Status    Status
 	ExpiresAt time.Time
 	CreatedAt time.Time
+	// Quota 为可选的同意级周期性用量额度；零值表示不设额度，行为与现在完全一致。
+	Quota quota.Policy
 }
 
 // RejectReason 是可区分的拒绝原因。
