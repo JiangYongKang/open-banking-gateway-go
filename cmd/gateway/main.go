@@ -10,6 +10,7 @@ import (
 	"github.com/highcumontoa/open-banking-gateway-go/internal/gateway"
 	"github.com/highcumontoa/open-banking-gateway-go/internal/idempotency"
 	"github.com/highcumontoa/open-banking-gateway-go/internal/ledger"
+	"github.com/highcumontoa/open-banking-gateway-go/internal/quota"
 	"github.com/highcumontoa/open-banking-gateway-go/internal/ratelimit"
 )
 
@@ -24,11 +25,18 @@ func main() {
 		ID: "c-expired", TenantID: "tenant-a", ClientID: "client-1",
 		Scopes: []string{"payment:write"}, ExpiresAt: now.Add(-time.Minute),
 	}))
+	// 带周期额度的同意：每自然周最多 2 笔。
+	must(store.Create(consent.Consent{
+		ID: "c-quota", TenantID: "tenant-a", ClientID: "client-1",
+		Scopes: []string{"payment:write"}, ExpiresAt: now.Add(time.Hour),
+		Quota: &quota.Limit{Period: quota.PeriodWeekly, MaxCount: 2},
+	}))
 
 	gw := gateway.New(
 		consent.NewAuthorizer(store, time.Now),
 		idempotency.NewMemoryStore(),
 		ratelimit.NewLimiter(ratelimit.Limit{Requests: 3, Window: time.Minute}, time.Now),
+		quota.NewManager(time.Now),
 		ledger.NewMock(),
 		time.Now,
 	)
@@ -80,6 +88,20 @@ func main() {
 	revoked := base
 	revoked.IdempotencyKey = "k-6"
 	run("revoked consent", revoked)
+
+	// 同意级周期额度：每周 2 笔，第 3 笔被挡下并给出剩余与重置时间。
+	// 换用独立客户端维度，避免与上面的限流演示共用配额。
+	for i := 0; i < 3; i++ {
+		r := base
+		r.ConsentID = "c-quota"
+		r.ClientID = "client-2"
+		r.IdempotencyKey = fmt.Sprintf("k-quota-%d", i+1)
+		run(fmt.Sprintf("weekly quota #%d", i+1), r)
+	}
+	if st, err := gw.QuotaStatus("tenant-a", "c-quota"); err == nil && st != nil {
+		fmt.Printf("[%-22s] used=%d remaining=%d reset_at=%s\n", "quota status",
+			st.UsedCount, st.RemainingCount, st.ResetAt.UTC().Format(time.RFC3339))
+	}
 }
 
 func must(err error) {

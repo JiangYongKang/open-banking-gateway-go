@@ -6,6 +6,7 @@ type Code string
 const (
 	CodeConsentDenied       Code = "CONSENT_DENIED"
 	CodeRateLimited         Code = "RATE_LIMITED"
+	CodeQuotaExceeded       Code = "QUOTA_EXCEEDED"
 	CodeIdempotencyConflict Code = "IDEMPOTENCY_CONFLICT"
 	CodeUpstreamRejected    Code = "UPSTREAM_REJECTED"
 	CodeUpstreamTimeout     Code = "UPSTREAM_TIMEOUT"

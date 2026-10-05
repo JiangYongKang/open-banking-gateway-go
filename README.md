@@ -10,8 +10,9 @@ internal/
   consent/      同意生命周期（建立/撤销/到期）与授权判定
   idempotency/  幂等键状态机（占用/回放/冲突/放弃）
   ratelimit/    按 (租户, 客户端) 维度的固定窗口限流
+  quota/        同意级周期用量额度（笔数/累计金额，预占-实扣）
   ledger/       模拟核心账务服务（可注入超时/拒绝/内部故障）
-  gateway/      编排：同意 -> 限流 -> 幂等 -> 账务写入，归一化错误
+  gateway/      编排：同意 -> 限流 -> 幂等 -> 额度 -> 账务写入，归一化错误
 cmd/gateway/    本地演示程序
 ```
 
@@ -62,7 +63,34 @@ cmd/gateway/    本地演示程序
 - 每次放行消耗 1 个配额；拒绝响应返回剩余配额与 `ResetAt`（RFC3339）。
 - 被限流的请求不进入幂等与账务阶段。
 
-## 四、错误归一化
+## 四、同意级周期额度
+
+建立同意时可选配 `quota.Limit`（`Consent.Quota`，为 `nil` 表示不配额度，行为与之前完全一致）：
+
+```go
+Quota: &quota.Limit{Period: quota.PeriodWeekly, MaxCount: 100, MaxAmount: 1_000_000}
+```
+
+- **周期模型**：`DAILY`（自然日，00:00 UTC 对齐）、`WEEKLY`（自然周，周一 00:00 UTC
+  对齐，ISO 8601）、`MONTHLY`（自然月，1 日 00:00 UTC 对齐）。窗口起点由当前时刻
+  向下对齐到固定边界，**与请求到达时间无关，重置点确定、可复现**；时间源可注入，
+  测试中可确定性推进跨周期。
+- **上限维度**：`MaxCount`（每周期最大笔数）与 `MaxAmount`（每周期累计金额，最小货币
+  单位）可单独或同时配置；某维度为 0 表示该维度不限（查询时对应 `Remaining` 为 -1）。
+- **扣减时机**：请求通过同意校验、限流、幂等占用后做**预占**（tentative 计入已用），
+  账务写入**最终成功**才 `Commit` 落定为实扣；上游拒绝/超时/内部错误时 `Release`
+  全额退回，**失败不扣额度**，故障恢复后同键重试可正常扣减。
+- **恰好一次**：预占按 `(同意, 周期窗口, 幂等键)` 去重——同一幂等键无论重复提交还是
+  并发重试风暴，全周期只扣一次；幂等回放直接返回首个结果，不触碰额度。
+- **隔离**：用量按同意 ID 完全隔离，一个同意用尽不影响其他同意，也不影响未配额度
+  的同意。
+- **额度用尽的拒绝**：返回独立错误码 `QUOTA_EXCEEDED`（与 `CONSENT_DENIED`、
+  `RATE_LIMITED` 明确区分），消息携带本周期 `remaining_count` / `remaining_amount`
+  与 `reset_at`（RFC3339）。被挡下的写入会释放幂等占用，下一周期同键重试可正常执行。
+- **用量查询**：`Gateway.QuotaStatus(tenantID, consentID)` 返回当前周期已用、剩余与
+  下次重置时间；未配额度的同意返回 `(nil, nil)`；跨租户查询按 `CONSENT_DENIED` 拒绝。
+
+## 五、错误归一化
 
 底层异常不会透出，网关只返回可区分的错误类别（`gateway.Code`）：
 
@@ -70,12 +98,13 @@ cmd/gateway/    本地演示程序
 |---|---|
 | `CONSENT_DENIED` | 同意校验未通过（附具体拒绝原因） |
 | `RATE_LIMITED` | 触发限流配额 |
+| `QUOTA_EXCEEDED` | 同意本周期额度用尽（附剩余量与重置时间） |
 | `IDEMPOTENCY_CONFLICT` | 幂等键内容冲突或同键处理中 |
 | `UPSTREAM_REJECTED` | 上游核心账务明确拒绝 |
 | `UPSTREAM_TIMEOUT` | 上游核心账务超时 |
 | `INTERNAL` | 内部故障（未分类的底层异常统一归一） |
 
-## 五、本地验证
+## 六、本地验证
 
 要求 Go 1.25+。
 
@@ -89,8 +118,11 @@ go test ./... -race -count=1
 # 带判定日志运行（打印请求关键字段与判定依据）
 go test ./... -run . -v
 
-# 运行本地演示：首次写入、幂等回放、键冲突、缺省/过期/撤销/越权同意、限流
+# 运行本地演示：首次写入、幂等回放、键冲突、缺省/过期/撤销/越权同意、限流、周期额度
 go run ./cmd/gateway
+
+# 只跑额度相关用例（含并发只扣一次、用尽可区分、跨周重置、失败不扣、同意间隔离）
+go test ./internal/quota/ ./internal/gateway/ -run 'Quota|WeeklyReset' -race -count=1 -v
 ```
 
 演示程序输出示例：
@@ -104,4 +136,8 @@ go run ./cmd/gateway
 [expired consent       ] REJECTED CONSENT_DENIED: CONSENT_EXPIRED
 [scope insufficient    ] REJECTED CONSENT_DENIED: CONSENT_SCOPE_INSUFFICIENT
 [revoked consent       ] REJECTED CONSENT_DENIED: CONSENT_REVOKED
+[weekly quota #1       ] OK entry=txn-2 replayed=false
+[weekly quota #2       ] OK entry=txn-3 replayed=false
+[weekly quota #3       ] REJECTED QUOTA_EXCEEDED: consent period allowance exhausted, remaining_count=0 remaining_amount=-1 reset_at=2026-10-12T00:00:00Z
+[quota status          ] used=2 remaining=0 reset_at=2026-10-12T00:00:00Z
 ```
